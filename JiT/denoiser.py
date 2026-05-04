@@ -392,12 +392,11 @@ class Denoiser(nn.Module):
         low_hw = (self.img_size // f0, self.img_size // f0)
         low_net = self._make_ralu_low_net()
 
-        starts = [0.0, self.ralu_e[0], self.ralu_e[1]]
-        ends = self.ralu_e
-
         z = self.noise_scale * torch.randn(bsz, 3, low_hw[0], low_hw[1], device=device)
 
-        ts = torch.linspace(starts[0], ends[0], self.ralu_N[0] + 1, device=device)
+        current_t = 0.0
+
+        ts = torch.linspace(current_t, self.ralu_e[0], self.ralu_N[0] + 1, device=device)
         for i in range(self.ralu_N[0]):
             z, _ = self._ode_step_with_fn(
                 lambda zz, tt, yy: self._cfg_v_and_x(low_net, zz, tt, yy),
@@ -410,18 +409,21 @@ class Denoiser(nn.Module):
         _, x0_low = self._cfg_v_and_x(low_net, z, ts[-1], labels)
         layout = self._edge_layout_from_low_x0(x0_low)
         z = self._lift_low_state_to_full(z, x0_low, ts[-1], full_hw)
+        current_t = float(ts[-1].detach().cpu().item())
 
-        ts = torch.linspace(starts[1], ends[1], self.ralu_N[1] + 1, device=device)
-        for i in range(self.ralu_N[1]):
-            z, _ = self._ode_step_with_fn(
-                lambda zz, tt, yy: self._mixed_sparse_forward(zz, tt, yy, layout, low_net),
-                z,
-                ts[i],
-                ts[i + 1],
-                labels,
-            )
+        if self.ralu_N[1] > 0:
+            ts = torch.linspace(current_t, self.ralu_e[1], self.ralu_N[1] + 1, device=device)
+            for i in range(self.ralu_N[1]):
+                z, _ = self._ode_step_with_fn(
+                    lambda zz, tt, yy: self._mixed_sparse_forward(zz, tt, yy, layout, low_net),
+                    z,
+                    ts[i],
+                    ts[i + 1],
+                    labels,
+                )
+            current_t = float(ts[-1].detach().cpu().item())
 
-        ts = torch.linspace(starts[2], ends[2], self.ralu_N[2] + 1, device=device)
+        ts = torch.linspace(current_t, self.ralu_e[2], self.ralu_N[2] + 1, device=device)
         for i in range(self.ralu_N[2]):
             z, _ = self._ode_step_with_fn(
                 lambda zz, tt, yy: self._cfg_v_and_x(self.net, zz, tt, yy),
