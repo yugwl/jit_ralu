@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import math
 import torch.nn.functional as F
-from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
+from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm, rotate_half
 
 
 def modulate(x, shift, scale):
@@ -137,6 +137,24 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+    def forward_mixed(self, x, rope, coords, num_cls_token=0):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        q = rope(q, coords, num_cls_token=num_cls_token)
+        k = rope(k, coords, num_cls_token=num_cls_token)
+
+        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 
 class SwiGLUFFN(nn.Module):
     def __init__(
@@ -179,6 +197,12 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
+    def forward_mixed(self, x, c):
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
+
 
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
@@ -200,6 +224,49 @@ class JiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
+
+    def forward_mixed(self, x, c, feat_rope, coords, num_cls_token=0):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa.unsqueeze(1) * self.attn.forward_mixed(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            rope=feat_rope,
+            coords=coords,
+            num_cls_token=num_cls_token,
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class IndexedVisionRotaryEmbedding(nn.Module):
+    def __init__(self, dim, theta=10000):
+        super().__init__()
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        self.register_buffer("freqs", freqs, persistent=False)
+
+    def forward(self, x, coords, num_cls_token=0):
+        if num_cls_token > 0:
+            cls_tokens = x[:, :, :num_cls_token, :]
+            img_tokens = x[:, :, num_cls_token:, :]
+        else:
+            cls_tokens = None
+            img_tokens = x
+
+        coords = coords.to(device=img_tokens.device, dtype=torch.float32)
+        freqs = self.freqs.to(device=img_tokens.device)
+
+        freqs_h = torch.einsum("n,d->nd", coords[:, 0], freqs)
+        freqs_w = torch.einsum("n,d->nd", coords[:, 1], freqs)
+        freqs_h = freqs_h.repeat_interleave(2, dim=-1)
+        freqs_w = freqs_w.repeat_interleave(2, dim=-1)
+        freqs_hw = torch.cat([freqs_h, freqs_w], dim=-1)
+
+        cos = freqs_hw.cos().to(dtype=img_tokens.dtype)
+        sin = freqs_hw.sin().to(dtype=img_tokens.dtype)
+        img_tokens = img_tokens * cos[None, None, :, :] + rotate_half(img_tokens) * sin[None, None, :, :]
+
+        if cls_tokens is not None:
+            return torch.cat([cls_tokens, img_tokens], dim=2)
+        return img_tokens
 
 
 class JiT(nn.Module):
@@ -262,6 +329,7 @@ class JiT(nn.Module):
             pt_seq_len=hw_seq_len,
             num_cls_token=self.in_context_len
         )
+        self.feat_rope_indexed = IndexedVisionRotaryEmbedding(dim=half_head_dim)
 
         # transformer
         self.blocks = nn.ModuleList([
@@ -327,6 +395,63 @@ class JiT(nn.Module):
         x = torch.einsum('nhwpqc->nchpwq', x)
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
+
+    def _sincos_pos_embed_1d(self, embed_dim, pos):
+        assert embed_dim % 2 == 0
+        omega = torch.arange(embed_dim // 2, device=pos.device, dtype=torch.float32)
+        omega = omega / (embed_dim / 2.)
+        omega = 1. / (10000 ** omega)
+        out = torch.einsum("n,d->nd", pos.float(), omega)
+        return torch.cat([out.sin(), out.cos()], dim=1)
+
+    def pos_embed_for_coords(self, coords, dtype=None):
+        """
+        coords: [N, 2] as (row, col) in this model's full-res patch grid.
+        returns: [1, N, hidden_size]
+        """
+        half_dim = self.hidden_size // 2
+        pos_w = self._sincos_pos_embed_1d(half_dim, coords[:, 1])
+        pos_h = self._sincos_pos_embed_1d(half_dim, coords[:, 0])
+        pos = torch.cat([pos_w, pos_h], dim=1).unsqueeze(0)
+        if dtype is not None:
+            pos = pos.to(dtype=dtype)
+        return pos
+
+    def forward_mixed_tokens(self, tokens, coords, t, y):
+        """
+        tokens: [B, N, hidden_size], already patch-embedded and not position-embedded.
+        coords: [N, 2], token coordinates in the full-res patch grid.
+        t: [B,]
+        y: [B,]
+
+        Returns mixed patch predictions shaped [B, N, patch_size*patch_size*C].
+        """
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y)
+        c = t_emb + y_emb
+
+        coords = coords.to(device=tokens.device, dtype=torch.float32)
+        x = tokens + self.pos_embed_for_coords(coords, dtype=tokens.dtype)
+        num_cls_token = 0
+
+        for i, block in enumerate(self.blocks):
+            if self.in_context_len > 0 and i == self.in_context_start:
+                in_context_tokens = y_emb.unsqueeze(1).repeat(1, self.in_context_len, 1)
+                in_context_tokens += self.in_context_posemb
+                x = torch.cat([in_context_tokens, x], dim=1)
+                num_cls_token = self.in_context_len
+            x = block.forward_mixed(
+                x,
+                c,
+                feat_rope=self.feat_rope_indexed,
+                coords=coords,
+                num_cls_token=num_cls_token,
+            )
+
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:]
+
+        return self.final_layer.forward_mixed(x, c)
 
     def forward(self, x, t, y):
         """

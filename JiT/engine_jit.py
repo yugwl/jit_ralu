@@ -72,10 +72,18 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     num_steps = args.num_images // (batch_size * world_size) + 1
 
     # Construct the folder name for saving generated images.
+    sampler_tag = "{}-steps{}".format(model_without_ddp.method, model_without_ddp.steps)
+    if getattr(model_without_ddp, "use_ralu", False):
+        sampler_tag = "{}-raluN{}-ralue{}-upratio{}".format(
+            model_without_ddp.method,
+            "-".join(str(v) for v in model_without_ddp.ralu_N),
+            "-".join(str(v) for v in model_without_ddp.ralu_e),
+            model_without_ddp.ralu_up_ratio,
+        )
     save_folder = os.path.join(
         args.output_dir,
-        "{}-steps{}-cfg{}-interval{}-{}-image{}-res{}".format(
-            model_without_ddp.method, model_without_ddp.steps, model_without_ddp.cfg_scale,
+        "{}-cfg{}-interval{}-{}-image{}-res{}".format(
+            sampler_tag, model_without_ddp.cfg_scale,
             model_without_ddp.cfg_interval[0], model_without_ddp.cfg_interval[1], args.num_images, args.img_size
         )
     )
@@ -91,6 +99,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         ema_state_dict[name] = model_without_ddp.ema_params1[i]
     print("Switch to ema")
     model_without_ddp.load_state_dict(ema_state_dict)
+    if hasattr(model_without_ddp, "reset_ralu_cache"):
+        model_without_ddp.reset_ralu_cache()
 
     # ensure that the number of images per class is equal.
     class_num = args.class_num
@@ -129,6 +139,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     # back to no ema
     print("Switch back from ema")
     model_without_ddp.load_state_dict(model_state_dict)
+    if hasattr(model_without_ddp, "reset_ralu_cache"):
+        model_without_ddp.reset_ralu_cache()
 
     # compute FID and IS
     if log_writer is not None:

@@ -84,6 +84,18 @@ def get_args_parser():
     parser.add_argument('--evaluate_gen', action='store_true')
     parser.add_argument('--gen_bsz', type=int, default=256,
                         help='Generation batch size')
+    parser.add_argument('--use_ralu', action='store_true',
+                        help='Use Pixel-RALU accelerated sampling for JiT')
+    parser.add_argument('--ralu_f0', type=int, default=2,
+                        help='Spatial downsample factor for Pixel-RALU stage 1')
+    parser.add_argument('--ralu_N', type=int, nargs='+', default=[10, 4, 8],
+                        help='Number of sampling steps for the 3 Pixel-RALU stages')
+    parser.add_argument('--ralu_e', type=float, nargs='+', default=[0.35, 0.55, 1.0],
+                        help='End t for the 3 Pixel-RALU stages; the last value must be 1.0')
+    parser.add_argument('--ralu_up_ratio', type=float, default=0.3,
+                        help='Fraction of low-res edge patches to enter full-res early')
+    parser.add_argument('--ralu_hf_noise', type=float, default=0.25,
+                        help='High-frequency noise injected when lifting low-res state')
 
     # dataset
     parser.add_argument('--data_path', default='./data/imagenet', type=str,
