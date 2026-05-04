@@ -379,6 +379,20 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def generate_ralu(self, labels):
+        return self.generate_ralu_diagnostic(labels)["sample"]
+
+    @torch.no_grad()
+    def generate_ralu_diagnostic(self, labels):
+        """
+        Conservative two-stage Pixel-RALU diagnostic path.
+
+        Stage 1: low-res JiT denoising from 0 -> ralu_e[0].
+        Stage 2: directly lift to full resolution.
+        Stage 3: full-res JiT refinement from ralu_e[0] -> 1.
+
+        This intentionally does not use mixed-token forward. The returned
+        intermediates make it possible to check whether low-res x0 is usable.
+        """
         assert len(self.ralu_N) == 3, "ralu_N must contain 3 stage lengths"
         assert len(self.ralu_e) == 3, "ralu_e must contain 3 stage end times"
         assert abs(self.ralu_e[-1] - 1.0) < 1e-6, "ralu_e must end at 1.0"
@@ -394,9 +408,7 @@ class Denoiser(nn.Module):
 
         z = self.noise_scale * torch.randn(bsz, 3, low_hw[0], low_hw[1], device=device)
 
-        current_t = 0.0
-
-        ts = torch.linspace(current_t, self.ralu_e[0], self.ralu_N[0] + 1, device=device)
+        ts = torch.linspace(0.0, self.ralu_e[0], self.ralu_N[0] + 1, device=device)
         for i in range(self.ralu_N[0]):
             z, _ = self._ode_step_with_fn(
                 lambda zz, tt, yy: self._cfg_v_and_x(low_net, zz, tt, yy),
@@ -407,24 +419,13 @@ class Denoiser(nn.Module):
             )
 
         _, x0_low = self._cfg_v_and_x(low_net, z, ts[-1], labels)
-        layout = self._edge_layout_from_low_x0(x0_low)
+        x0_low_up = F.interpolate(x0_low, size=full_hw, mode="bilinear", align_corners=False)
         z = self._lift_low_state_to_full(z, x0_low, ts[-1], full_hw)
-        current_t = float(ts[-1].detach().cpu().item())
+        z_lift = z
 
-        if self.ralu_N[1] > 0:
-            ts = torch.linspace(current_t, self.ralu_e[1], self.ralu_N[1] + 1, device=device)
-            for i in range(self.ralu_N[1]):
-                z, _ = self._ode_step_with_fn(
-                    lambda zz, tt, yy: self._mixed_sparse_forward(zz, tt, yy, layout, low_net),
-                    z,
-                    ts[i],
-                    ts[i + 1],
-                    labels,
-                )
-            current_t = float(ts[-1].detach().cpu().item())
-
-        ts = torch.linspace(current_t, self.ralu_e[2], self.ralu_N[2] + 1, device=device)
-        for i in range(self.ralu_N[2]):
+        full_steps = self.ralu_N[2]
+        ts = torch.linspace(self.ralu_e[0], self.ralu_e[2], full_steps + 1, device=device)
+        for i in range(full_steps):
             z, _ = self._ode_step_with_fn(
                 lambda zz, tt, yy: self._cfg_v_and_x(self.net, zz, tt, yy),
                 z,
@@ -433,7 +434,13 @@ class Denoiser(nn.Module):
                 labels,
             )
 
-        return z
+        return {
+            "sample": z,
+            "x0_low": x0_low,
+            "x0_low_up": x0_low_up,
+            "z_lift": z_lift,
+            "t_lift": torch.tensor(self.ralu_e[0], device=device),
+        }
 
     @torch.no_grad()
     def _euler_step(self, z, t, t_next, labels):
