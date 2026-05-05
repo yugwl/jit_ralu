@@ -109,7 +109,7 @@ def main():
     )
     parser.add_argument(
         "--out_dir",
-        default="/home/cvip/deyu/jit_ralu/JiT/result_diag",
+        default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full",
     )
     parser.add_argument("--label", type=int, default=2)
     parser.add_argument("--seed", type=int, default=3)
