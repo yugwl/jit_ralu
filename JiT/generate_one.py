@@ -13,7 +13,7 @@ from denoiser import Denoiser
 def build_args():
     return SimpleNamespace(
         # checkpoint / model
-        model="JiT-B/32",
+        model="JiT-L/16",
         img_size=512,
         class_num=1000,
 
@@ -72,7 +72,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
-        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-b-32/checkpoint-last.pth",
+        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-l-16/checkpoint-last.pth",
     )
     parser.add_argument(
         "--out_dir",
