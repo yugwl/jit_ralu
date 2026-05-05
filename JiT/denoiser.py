@@ -45,6 +45,8 @@ class Denoiser(nn.Module):
         self.ralu_e = getattr(args, "ralu_e", [0.35, 0.55, 1.0])
         self.ralu_up_ratio = getattr(args, "ralu_up_ratio", 0.3)
         self.ralu_hf_noise = getattr(args, "ralu_hf_noise", 0.25)
+        self.ralu_lift_mode = getattr(args, "ralu_lift_mode", "fresh_noise")
+        self.ralu_low_pos_mode = getattr(args, "ralu_low_pos_mode", "scaled")
 
         self.model_name = args.model
         self.attn_dropout = args.attn_dropout
@@ -154,10 +156,72 @@ class Denoiser(nn.Module):
             if key in dst and dst[key].shape == value.shape:
                 dst[key].copy_(value)
         low_net.load_state_dict(dst, strict=True)
+        self._configure_ralu_low_spatial_embeddings(low_net)
 
         # Bypass nn.Module registration so strict load_state_dict stays unchanged.
         self.__dict__["_ralu_low_net"] = low_net
         return low_net
+
+    def _ralu_low_grid_coords(self, low_net):
+        g_low = low_net.input_size // low_net.patch_size
+        rows, cols = torch.meshgrid(
+            torch.arange(g_low, device=low_net.pos_embed.device, dtype=torch.float32),
+            torch.arange(g_low, device=low_net.pos_embed.device, dtype=torch.float32),
+            indexing="ij",
+        )
+        coords = torch.stack([rows.flatten(), cols.flatten()], dim=1)
+        if self.ralu_low_pos_mode == "scaled":
+            coords = coords * self.ralu_f0 + (self.ralu_f0 - 1) * 0.5
+        elif self.ralu_low_pos_mode != "native":
+            raise ValueError(f"Unsupported ralu_low_pos_mode: {self.ralu_low_pos_mode}")
+        return coords
+
+    def _rope_cos_sin_for_coords(self, coords, hidden_size, num_heads, num_cls_token=0):
+        half_head_dim = hidden_size // num_heads // 2
+        freqs = 1.0 / (
+            10000 ** (torch.arange(0, half_head_dim, 2, device=coords.device).float() / half_head_dim)
+        )
+
+        freqs_h = torch.einsum("n,d->nd", coords[:, 0].float(), freqs)
+        freqs_w = torch.einsum("n,d->nd", coords[:, 1].float(), freqs)
+        freqs_h = freqs_h.repeat_interleave(2, dim=-1)
+        freqs_w = freqs_w.repeat_interleave(2, dim=-1)
+        freqs_hw = torch.cat([freqs_h, freqs_w], dim=-1)
+
+        cos = freqs_hw.cos()
+        sin = freqs_hw.sin()
+        if num_cls_token > 0:
+            cos_pad = torch.ones(num_cls_token, cos.shape[-1], device=coords.device, dtype=cos.dtype)
+            sin_pad = torch.zeros(num_cls_token, sin.shape[-1], device=coords.device, dtype=sin.dtype)
+            cos = torch.cat([cos_pad, cos], dim=0)
+            sin = torch.cat([sin_pad, sin], dim=0)
+        return cos, sin
+
+    def _configure_ralu_low_spatial_embeddings(self, low_net):
+        if self.ralu_low_pos_mode == "native":
+            return
+
+        coords = self._ralu_low_grid_coords(low_net)
+        pos_embed = low_net.pos_embed_for_coords(coords, dtype=low_net.pos_embed.dtype)
+        low_net.pos_embed.data.copy_(pos_embed)
+
+        cos, sin = self._rope_cos_sin_for_coords(
+            coords,
+            hidden_size=low_net.hidden_size,
+            num_heads=low_net.num_heads,
+            num_cls_token=0,
+        )
+        low_net.feat_rope.freqs_cos = cos
+        low_net.feat_rope.freqs_sin = sin
+
+        cos, sin = self._rope_cos_sin_for_coords(
+            coords,
+            hidden_size=low_net.hidden_size,
+            num_heads=low_net.num_heads,
+            num_cls_token=low_net.in_context_len,
+        )
+        low_net.feat_rope_incontext.freqs_cos = cos
+        low_net.feat_rope_incontext.freqs_sin = sin
 
     def _expand_t(self, t, z):
         if not torch.is_tensor(t):
@@ -212,15 +276,26 @@ class Denoiser(nn.Module):
     @torch.no_grad()
     def _lift_low_state_to_full(self, z_low, x0_low, t, full_hw):
         t = self._expand_t(t, z_low)
-        eps_low = (z_low - t * x0_low) / (1.0 - t).clamp_min(self.t_eps)
-
         x0_full = F.interpolate(x0_low, size=full_hw, mode="bilinear", align_corners=False)
-        eps_full = F.interpolate(eps_low, size=full_hw, mode="nearest")
 
-        noise = torch.randn_like(eps_full) * self.noise_scale
-        noise_low = F.avg_pool2d(noise, kernel_size=self.ralu_f0, stride=self.ralu_f0)
-        noise_low = F.interpolate(noise_low, size=full_hw, mode="nearest")
-        eps_full = eps_full + self.ralu_hf_noise * (noise - noise_low)
+        if self.ralu_lift_mode == "fresh_noise":
+            eps_full = torch.randn_like(x0_full) * self.noise_scale
+        elif self.ralu_lift_mode == "upsample_eps":
+            eps_low = (z_low - t * x0_low) / (1.0 - t).clamp_min(self.t_eps)
+            eps_full = F.interpolate(eps_low, size=full_hw, mode="nearest")
+        elif self.ralu_lift_mode == "mixed_noise":
+            eps_low = (z_low - t * x0_low) / (1.0 - t).clamp_min(self.t_eps)
+            eps_up = F.interpolate(eps_low, size=full_hw, mode="nearest")
+            eps_rand = torch.randn_like(x0_full) * self.noise_scale
+            eps_full = 0.5 * eps_up + 0.5 * eps_rand
+        else:
+            raise ValueError(f"Unsupported ralu_lift_mode: {self.ralu_lift_mode}")
+
+        if self.ralu_hf_noise > 0:
+            noise = torch.randn_like(x0_full) * self.noise_scale
+            noise_low = F.avg_pool2d(noise, kernel_size=self.ralu_f0, stride=self.ralu_f0)
+            noise_low = F.interpolate(noise_low, size=full_hw, mode="nearest")
+            eps_full = eps_full + self.ralu_hf_noise * (noise - noise_low)
 
         return t * x0_full + (1.0 - t) * eps_full
 
@@ -422,6 +497,7 @@ class Denoiser(nn.Module):
         x0_low_up = F.interpolate(x0_low, size=full_hw, mode="bilinear", align_corners=False)
         z = self._lift_low_state_to_full(z, x0_low, ts[-1], full_hw)
         z_lift = z
+        _, x0_lift_full = self._cfg_v_and_x(self.net, z_lift, ts[-1], labels)
 
         full_steps = self.ralu_N[2]
         ts = torch.linspace(self.ralu_e[0], self.ralu_e[2], full_steps + 1, device=device)
@@ -439,6 +515,7 @@ class Denoiser(nn.Module):
             "x0_low": x0_low,
             "x0_low_up": x0_low_up,
             "z_lift": z_lift,
+            "x0_lift_full": x0_lift_full,
             "t_lift": torch.tensor(self.ralu_e[0], device=device),
         }
 
