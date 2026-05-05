@@ -9,6 +9,29 @@ from torchvision.utils import save_image
 from denoiser import Denoiser
 
 
+def _patch_size_from_model_name(model_name):
+    return int(model_name.split("/")[-1])
+
+
+def apply_checkpoint_defaults(cli):
+    ckpt = torch.load(cli.ckpt, map_location="cpu")
+    pos_embed = ckpt["model"]["net.pos_embed"]
+    grid_size = int(pos_embed.shape[1] ** 0.5)
+    assert grid_size * grid_size == pos_embed.shape[1]
+
+    if cli.img_size is None:
+        cli.img_size = grid_size * _patch_size_from_model_name(cli.model)
+    if cli.noise_scale is None:
+        cli.noise_scale = 2.0 if cli.img_size == 512 else 1.0
+    if cli.cfg is None:
+        cli.cfg = 2.5 if cli.img_size == 512 else 2.4
+
+    print("checkpoint pos_embed:", tuple(pos_embed.shape))
+    print("inferred grid_size:", grid_size)
+    print("runtime img_size:", cli.img_size)
+    return cli
+
+
 def build_args(cli):
     return SimpleNamespace(
         # checkpoint / model
@@ -83,9 +106,9 @@ def main():
     parser.add_argument("--label", type=int, default=0)
     parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--model", default="JiT-L/16")
-    parser.add_argument("--img_size", type=int, default=256)
-    parser.add_argument("--noise_scale", type=float, default=1.0)
-    parser.add_argument("--cfg", type=float, default=2.4)
+    parser.add_argument("--img_size", type=int, default=None)
+    parser.add_argument("--noise_scale", type=float, default=None)
+    parser.add_argument("--cfg", type=float, default=None)
     parser.add_argument("--interval_min", type=float, default=0.1)
     parser.add_argument("--interval_max", type=float, default=1.0)
     parser.add_argument("--sampling_method", default="heun", choices=["heun", "euler"])
@@ -100,6 +123,7 @@ def main():
     parser.add_argument("--no_ralu", action="store_true")
     parser.add_argument("--no_ema", action="store_true")
     cli = parser.parse_args()
+    cli = apply_checkpoint_defaults(cli)
 
     os.makedirs(cli.out_dir, exist_ok=True)
 
