@@ -47,6 +47,7 @@ class Denoiser(nn.Module):
         self.ralu_hf_noise = getattr(args, "ralu_hf_noise", 0.25)
         self.ralu_lift_mode = getattr(args, "ralu_lift_mode", "fresh_noise")
         self.ralu_low_pos_mode = getattr(args, "ralu_low_pos_mode", "scaled")
+        self.ralu_mode = getattr(args, "ralu_mode", "low_full_diag")
 
         self.model_name = args.model
         self.attn_dropout = args.attn_dropout
@@ -386,6 +387,96 @@ class Denoiser(nn.Module):
         return torch.cat([low_part, edge_part], dim=1)
 
     @torch.no_grad()
+    def _edge_layout_from_full_x0(self, x0_full):
+        bsz, _, h, w = x0_full.shape
+        p = self.net.patch_size
+        f0 = self.ralu_f0
+        assert h % (p * f0) == 0 and w % (p * f0) == 0, "image size must be divisible by patch_size * ralu_f0"
+
+        x = (x0_full.clamp(-1, 1) + 1) * 0.5
+        gray = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+
+        kx = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, 3, 3)
+        ky = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+            device=x.device,
+            dtype=x.dtype,
+        ).view(1, 1, 3, 3)
+
+        gx = F.conv2d(gray, kx, padding=1)
+        gy = F.conv2d(gray, ky, padding=1)
+        mag = (gx.square() + gy.square()).sqrt()
+
+        score = F.avg_pool2d(mag, kernel_size=p * f0, stride=p * f0).mean(dim=0).flatten()
+        num_coarse = score.numel()
+        if self.ralu_up_ratio <= 0:
+            k = 0
+            edge_coarse_idx = torch.empty(0, device=x.device, dtype=torch.long)
+        else:
+            k = min(num_coarse, max(1, int(num_coarse * self.ralu_up_ratio)))
+            edge_coarse_idx = torch.sort(torch.topk(score, k=k, largest=True).indices).values
+
+        edge_coarse_mask = torch.zeros(num_coarse, device=x.device, dtype=torch.bool)
+        if k > 0:
+            edge_coarse_mask.scatter_(0, edge_coarse_idx, True)
+        keep_coarse_idx = torch.nonzero(~edge_coarse_mask, as_tuple=False).flatten()
+
+        g_full = h // p
+        g_coarse = g_full // f0
+        center = (f0 - 1) * 0.5
+
+        coarse_rows = keep_coarse_idx // g_coarse
+        coarse_cols = keep_coarse_idx % g_coarse
+        coarse_coords = torch.stack(
+            [coarse_rows.float() * f0 + center, coarse_cols.float() * f0 + center],
+            dim=1,
+        )
+
+        if k > 0:
+            edge_rows = edge_coarse_idx // g_coarse
+            edge_cols = edge_coarse_idx % g_coarse
+            offsets = torch.arange(f0, device=x.device, dtype=torch.long)
+            off_r, off_c = torch.meshgrid(offsets, offsets, indexing="ij")
+            full_rows = edge_rows[:, None] * f0 + off_r.flatten()[None, :]
+            full_cols = edge_cols[:, None] * f0 + off_c.flatten()[None, :]
+            edge_full_idx = (full_rows * g_full + full_cols).flatten()
+            edge_coords = torch.stack([full_rows.flatten().float(), full_cols.flatten().float()], dim=1)
+        else:
+            edge_full_idx = torch.empty(0, device=x.device, dtype=torch.long)
+            edge_coords = torch.empty(0, 2, device=x.device, dtype=torch.float32)
+
+        coords = torch.cat([coarse_coords, edge_coords], dim=0)
+        return {
+            "coords": coords,
+            "keep_low_idx": keep_coarse_idx,
+            "edge_full_idx": edge_full_idx,
+            "num_low_tokens": keep_coarse_idx.numel(),
+            "g_low": g_coarse,
+            "g_full": g_full,
+        }
+
+    @torch.no_grad()
+    def _build_full_mixed_tokens(self, z_full, layout):
+        bsz = z_full.size(0)
+        f0 = self.ralu_f0
+        g_full = layout["g_full"]
+        g_coarse = layout["g_low"]
+
+        full_tokens = self.net.x_embedder(z_full)
+        hidden = full_tokens.size(-1)
+        full_grid = full_tokens.reshape(bsz, g_full, g_full, hidden)
+        coarse_tokens = full_grid.reshape(bsz, g_coarse, f0, g_coarse, f0, hidden).mean(dim=(2, 4))
+        coarse_tokens = coarse_tokens.reshape(bsz, g_coarse * g_coarse, hidden)
+
+        coarse_part = coarse_tokens.index_select(1, layout["keep_low_idx"])
+        edge_part = full_tokens.index_select(1, layout["edge_full_idx"])
+        return torch.cat([coarse_part, edge_part], dim=1)
+
+    @torch.no_grad()
     def _scatter_mixed_patches_to_full(self, patch_pred, layout, full_hw):
         bsz = patch_pred.size(0)
         p = self.net.patch_size
@@ -453,8 +544,105 @@ class Denoiser(nn.Module):
         return v, x0
 
     @torch.no_grad()
+    def _full_mixed_sparse_forward(self, z_full, t, labels, layout):
+        t = self._expand_t(t, z_full)
+        t_flat = t.flatten()
+        tokens = self._build_full_mixed_tokens(z_full, layout)
+        coords = layout["coords"].to(device=z_full.device)
+
+        x_cond_patches = self.net.forward_mixed_tokens(tokens, coords, t_flat, labels)
+        x_cond = self._scatter_mixed_patches_to_full(x_cond_patches, layout, z_full.shape[-2:])
+        v_cond = (x_cond - z_full) / (1.0 - t).clamp_min(self.t_eps)
+
+        null_labels = torch.full_like(labels, self.num_classes)
+        x_uncond_patches = self.net.forward_mixed_tokens(tokens, coords, t_flat, null_labels)
+        x_uncond = self._scatter_mixed_patches_to_full(x_uncond_patches, layout, z_full.shape[-2:])
+        v_uncond = (x_uncond - z_full) / (1.0 - t).clamp_min(self.t_eps)
+
+        low, high = self.cfg_interval
+        interval_mask = (t < high) & ((low == 0) | (t > low))
+        cfg_scale_interval = torch.where(
+            interval_mask,
+            torch.full_like(t, float(self.cfg_scale)),
+            torch.ones_like(t),
+        )
+
+        v = v_uncond + cfg_scale_interval * (v_cond - v_uncond)
+        x0 = z_full + (1.0 - t).clamp_min(self.t_eps) * v
+        return v, x0
+
+    @torch.no_grad()
     def generate_ralu(self, labels):
+        if self.ralu_mode == "full_mixed_full":
+            return self.generate_ralu_full_mixed_diagnostic(labels)["sample"]
+        if self.ralu_mode != "low_full_diag":
+            raise ValueError(f"Unsupported ralu_mode: {self.ralu_mode}")
         return self.generate_ralu_diagnostic(labels)["sample"]
+
+    @torch.no_grad()
+    def generate_ralu_full_mixed_diagnostic(self, labels):
+        """
+        Full -> mixed-token -> full diagnostic path.
+
+        Stage 1: full-res JiT denoising from 0 -> ralu_e[0].
+        Stage 2: mixed-token JiT from ralu_e[0] -> ralu_e[1].
+        Stage 3: full-res JiT refinement from ralu_e[1] -> 1.
+        """
+        assert len(self.ralu_N) == 3, "ralu_N must contain 3 stage lengths"
+        assert len(self.ralu_e) == 3, "ralu_e must contain 3 stage end times"
+        assert abs(self.ralu_e[-1] - 1.0) < 1e-6, "ralu_e must end at 1.0"
+
+        device = labels.device
+        bsz = labels.size(0)
+        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
+
+        ts = torch.linspace(0.0, self.ralu_e[0], self.ralu_N[0] + 1, device=device)
+        for i in range(self.ralu_N[0]):
+            z, _ = self._ode_step_with_fn(
+                lambda zz, tt, yy: self._cfg_v_and_x(self.net, zz, tt, yy),
+                z,
+                ts[i],
+                ts[i + 1],
+                labels,
+            )
+
+        _, x0_stage1_full = self._cfg_v_and_x(self.net, z, ts[-1], labels)
+        z_after_stage1 = z
+        layout = self._edge_layout_from_full_x0(x0_stage1_full)
+        current_t = self.ralu_e[0]
+
+        if self.ralu_N[1] > 0:
+            ts = torch.linspace(current_t, self.ralu_e[1], self.ralu_N[1] + 1, device=device)
+            for i in range(self.ralu_N[1]):
+                z, _ = self._ode_step_with_fn(
+                    lambda zz, tt, yy: self._full_mixed_sparse_forward(zz, tt, yy, layout),
+                    z,
+                    ts[i],
+                    ts[i + 1],
+                    labels,
+                )
+            current_t = self.ralu_e[1]
+
+        z_after_mixed = z
+        _, x0_after_mixed_full = self._cfg_v_and_x(self.net, z, current_t, labels)
+
+        ts = torch.linspace(current_t, self.ralu_e[2], self.ralu_N[2] + 1, device=device)
+        for i in range(self.ralu_N[2]):
+            z, _ = self._ode_step_with_fn(
+                lambda zz, tt, yy: self._cfg_v_and_x(self.net, zz, tt, yy),
+                z,
+                ts[i],
+                ts[i + 1],
+                labels,
+            )
+
+        return {
+            "sample": z,
+            "x0_stage1_full": x0_stage1_full,
+            "z_after_stage1": z_after_stage1,
+            "z_after_mixed": z_after_mixed,
+            "x0_after_mixed_full": x0_after_mixed_full,
+        }
 
     @torch.no_grad()
     def generate_ralu_diagnostic(self, labels):

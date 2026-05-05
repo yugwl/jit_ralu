@@ -33,6 +33,13 @@ def apply_checkpoint_defaults(cli):
 
 
 def build_args(cli):
+    if cli.ralu_mode == "full_mixed_full":
+        ralu_N = [cli.stage1_steps, cli.mixed_steps, cli.stage3_steps]
+        ralu_e = [cli.stage1_end, cli.mixed_end, 1.0]
+    else:
+        ralu_N = [cli.low_steps, 0, cli.full_steps]
+        ralu_e = [cli.low_end, cli.low_end, 1.0]
+
     return SimpleNamespace(
         # checkpoint / model
         model=cli.model,
@@ -61,10 +68,11 @@ def build_args(cli):
 
         # conservative two-stage Pixel-RALU diagnostic
         use_ralu=not cli.no_ralu,
+        ralu_mode=cli.ralu_mode,
         ralu_f0=cli.ralu_f0,
-        ralu_N=[cli.low_steps, 0, cli.full_steps],
-        ralu_e=[cli.low_end, cli.low_end, 1.0],
-        ralu_up_ratio=0.0,
+        ralu_N=ralu_N,
+        ralu_e=ralu_e,
+        ralu_up_ratio=cli.ralu_up_ratio,
         ralu_hf_noise=cli.ralu_hf_noise,
         ralu_lift_mode=cli.lift_mode,
         ralu_low_pos_mode=cli.low_pos_mode,
@@ -113,10 +121,17 @@ def main():
     parser.add_argument("--interval_max", type=float, default=1.0)
     parser.add_argument("--sampling_method", default="euler", choices=["heun", "euler"])
     parser.add_argument("--num_sampling_steps", type=int, default=64)
+    parser.add_argument("--ralu_mode", default="low_full_diag", choices=["low_full_diag", "full_mixed_full"])
     parser.add_argument("--ralu_f0", type=int, default=2)
+    parser.add_argument("--ralu_up_ratio", type=float, default=0.3)
     parser.add_argument("--low_steps", type=int, default=16)
     parser.add_argument("--low_end", type=float, default=0.35)
     parser.add_argument("--full_steps", type=int, default=24)
+    parser.add_argument("--stage1_steps", type=int, default=20)
+    parser.add_argument("--stage1_end", type=float, default=0.30)
+    parser.add_argument("--mixed_steps", type=int, default=12)
+    parser.add_argument("--mixed_end", type=float, default=0.55)
+    parser.add_argument("--stage3_steps", type=int, default=32)
     parser.add_argument("--ralu_hf_noise", type=float, default=0.0)
     parser.add_argument("--lift_mode", default="fresh_noise", choices=["fresh_noise", "upsample_eps", "mixed_noise"])
     parser.add_argument("--low_pos_mode", default="scaled", choices=["scaled", "native"])
@@ -135,8 +150,10 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
     print("use_ralu:", args.use_ralu)
+    print("ralu_mode:", args.ralu_mode)
     print("ralu_N:", args.ralu_N)
     print("ralu_e:", args.ralu_e)
+    print("ralu_up_ratio:", args.ralu_up_ratio)
     print("ralu_hf_noise:", args.ralu_hf_noise)
     print("ralu_lift_mode:", args.ralu_lift_mode)
     print("ralu_low_pos_mode:", args.ralu_low_pos_mode)
@@ -150,18 +167,22 @@ def main():
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
         if args.use_ralu:
-            outputs = model.generate_ralu_diagnostic(labels)
+            if args.ralu_mode == "full_mixed_full":
+                outputs = model.generate_ralu_full_mixed_diagnostic(labels)
+            else:
+                outputs = model.generate_ralu_diagnostic(labels)
         else:
             outputs = {"sample": model.generate(labels)}
 
     prefix = os.path.join(cli.out_dir, f"label{cli.label}_seed{cli.seed}")
-    save_sample(outputs["sample"], f"{prefix}_{'ralu_a' if args.use_ralu else 'base'}.png")
+    suffix = args.ralu_mode if args.use_ralu else "base"
+    save_sample(outputs["sample"], f"{prefix}_{suffix}.png")
 
     if args.use_ralu:
-        save_sample(outputs["x0_low"], f"{prefix}_x0_low.png")
-        save_sample(outputs["x0_low_up"], f"{prefix}_x0_low_up.png")
-        save_sample(outputs["z_lift"], f"{prefix}_z_lift.png")
-        save_sample(outputs["x0_lift_full"], f"{prefix}_x0_lift_full.png")
+        for name, tensor in outputs.items():
+            if name == "sample" or not torch.is_tensor(tensor) or tensor.ndim != 4:
+                continue
+            save_sample(tensor, f"{prefix}_{name}.png")
 
     print("saved prefix:", prefix)
 
