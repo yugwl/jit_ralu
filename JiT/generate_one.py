@@ -71,17 +71,22 @@ def build_args(cli):
     )
 
 
-def load_checkpoint(model, ckpt_path, use_ema=True):
+def load_checkpoint(model, ckpt_path, ema="ema1"):
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(ckpt["model"], strict=True)
 
-    if use_ema and "model_ema1" in ckpt:
+    if ema in ("ema1", "ema2"):
+        ema_key = "model_ema1" if ema == "ema1" else "model_ema2"
+        if ema_key not in ckpt:
+            raise KeyError(f"{ema_key} not found in checkpoint")
         state = model.state_dict()
-        ema_state = ckpt["model_ema1"]
+        ema_state = ckpt[ema_key]
         for name, _ in model.named_parameters():
             if name in ema_state:
                 state[name] = ema_state[name]
         model.load_state_dict(state, strict=True)
+    elif ema != "raw":
+        raise ValueError(f"Unsupported ema mode: {ema}")
 
     return model
 
@@ -106,7 +111,9 @@ def main():
     parser.add_argument("--interval_min", type=float, default=0.1)
     parser.add_argument("--interval_max", type=float, default=1.0)
     parser.add_argument("--sampling_method", default="heun", choices=["heun", "euler"])
-    parser.add_argument("--num_sampling_steps", type=int, default=50)
+    parser.add_argument("--num_sampling_steps", type=int, default=80)
+    parser.add_argument("--num_samples", type=int, default=1)
+    parser.add_argument("--ema", default="ema1", choices=["ema1", "ema2", "raw"])
     parser.add_argument("--ralu_f0", type=int, default=2)
     parser.add_argument("--low_steps", type=int, default=16)
     parser.add_argument("--low_end", type=float, default=0.35)
@@ -133,30 +140,49 @@ def main():
     print("img_size:", args.img_size)
     print("noise_scale:", args.noise_scale)
     print("cfg:", args.cfg_scale if hasattr(args, "cfg_scale") else args.cfg)
+    print("num_sampling_steps:", args.num_sampling_steps)
+    print("num_samples:", args_cli.num_samples)
+    print("ema:", args_cli.ema)
     print("ralu_N:", args.ralu_N)
     print("ralu_e:", args.ralu_e)
     print("ralu_lift_mode:", args.ralu_lift_mode)
     print("ralu_low_pos_mode:", args.ralu_low_pos_mode)
 
     model = Denoiser(args)
-    model = load_checkpoint(model, args_cli.ckpt, use_ema=True)
+    model = load_checkpoint(model, args_cli.ckpt, ema=args_cli.ema)
     model.to(device)
     model.eval()
 
-    labels = torch.tensor([args_cli.label], device=device, dtype=torch.long)
+    labels = torch.full((args_cli.num_samples,), args_cli.label, device=device, dtype=torch.long)
 
     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-        image = model.generate(labels)
+        images = model.generate(labels)
 
-    image = (image + 1.0) / 2.0
-    image = image.clamp(0, 1)
+    images = (images + 1.0) / 2.0
+    images = images.clamp(0, 1)
 
-    out_path = os.path.join(
-        args_cli.out_dir,
-        f"sample_label{args_cli.label}_{'ralu' if args.use_ralu else 'base'}.png",
-    )
-    save_image(image, out_path)
-    print("saved:", out_path)
+    tag = "ralu" if args.use_ralu else "base"
+    if args_cli.num_samples == 1:
+        out_path = os.path.join(
+            args_cli.out_dir,
+            f"sample_label{args_cli.label}_{tag}_seed{args_cli.seed}_{args_cli.ema}_{args.num_sampling_steps}steps.png",
+        )
+        save_image(images, out_path)
+        print("saved:", out_path)
+    else:
+        grid_path = os.path.join(
+            args_cli.out_dir,
+            f"sample_label{args_cli.label}_{tag}_seed{args_cli.seed}_{args_cli.ema}_{args.num_sampling_steps}steps_grid.png",
+        )
+        save_image(images, grid_path, nrow=min(4, args_cli.num_samples))
+        print("saved:", grid_path)
+
+        for i, image in enumerate(images):
+            out_path = os.path.join(
+                args_cli.out_dir,
+                f"sample_label{args_cli.label}_{tag}_seed{args_cli.seed}_{args_cli.ema}_{args.num_sampling_steps}steps_{i:02d}.png",
+            )
+            save_image(image, out_path)
 
 
 if __name__ == "__main__":
