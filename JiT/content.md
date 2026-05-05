@@ -1,3 +1,5 @@
+```
+
 JiT/
 ├── README.md               # 项目的主说明文档，包含项目简介、安装和运行指南
 ├── LICENSE                 # 项目的开源许可证文件
@@ -28,3 +30,4 @@ JiT/
     ├── lr_sched.py         # 学习率调度器 (Learning Rate Scheduler) 定义，如 Warmup 或 Cosine 衰减
     ├── misc.py             # 杂项工具函数，包含分布式训练设置、日志记录、度量平均等通用功能
     └── model_util.py       # 模型相关的辅助函数，例如模型权重加载、初始化或参数量统计等
+```
