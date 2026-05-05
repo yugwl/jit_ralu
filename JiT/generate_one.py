@@ -41,10 +41,14 @@ def build_args():
         use_ralu=True,
         ralu_f0=2,
         # ralu_N=[10, 4, 8],
-        ralu_N=[12, 4, 10],
+        # ralu_N=[16, 0, 20],
+        # ralu_e=[0.35, 0.55, 1.0],
+        # ralu_up_ratio=0.0,
+        # ralu_hf_noise=1.0,
+        ralu_N=[16, 0, 24],
         ralu_e=[0.35, 0.55, 1.0],
-        ralu_up_ratio=0.3,
-        ralu_hf_noise=0.25,
+        ralu_up_ratio=0.0,
+        ralu_hf_noise=0.0,
     )
 
 

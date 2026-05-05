@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 使用第 4 张卡
 from types import SimpleNamespace
 
 import torch
@@ -77,8 +78,8 @@ def main():
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag",
     )
-    parser.add_argument("--label", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--label", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--model", default="JiT-B/32")
     parser.add_argument("--img_size", type=int, default=512)
     parser.add_argument("--noise_scale", type=float, default=2.0)
