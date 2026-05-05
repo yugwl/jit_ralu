@@ -43,6 +43,8 @@ def build_args(cli):
         ralu_e=[cli.low_end, cli.low_end, 1.0],
         ralu_up_ratio=0.0,
         ralu_hf_noise=cli.ralu_hf_noise,
+        ralu_lift_mode=cli.lift_mode,
+        ralu_low_pos_mode=cli.low_pos_mode,
     )
 
 
@@ -93,6 +95,8 @@ def main():
     parser.add_argument("--low_end", type=float, default=0.35)
     parser.add_argument("--full_steps", type=int, default=24)
     parser.add_argument("--ralu_hf_noise", type=float, default=0.0)
+    parser.add_argument("--lift_mode", default="fresh_noise", choices=["fresh_noise", "upsample_eps", "mixed_noise"])
+    parser.add_argument("--low_pos_mode", default="scaled", choices=["scaled", "native"])
     parser.add_argument("--no_ralu", action="store_true")
     parser.add_argument("--no_ema", action="store_true")
     cli = parser.parse_args()
@@ -110,6 +114,8 @@ def main():
     print("ralu_N:", args.ralu_N)
     print("ralu_e:", args.ralu_e)
     print("ralu_hf_noise:", args.ralu_hf_noise)
+    print("ralu_lift_mode:", args.ralu_lift_mode)
+    print("ralu_low_pos_mode:", args.ralu_low_pos_mode)
 
     model = Denoiser(args)
     model = load_checkpoint(model, cli.ckpt, use_ema=not cli.no_ema)
@@ -131,6 +137,7 @@ def main():
         save_sample(outputs["x0_low"], f"{prefix}_x0_low.png")
         save_sample(outputs["x0_low_up"], f"{prefix}_x0_low_up.png")
         save_sample(outputs["z_lift"], f"{prefix}_z_lift.png")
+        save_sample(outputs["x0_lift_full"], f"{prefix}_x0_lift_full.png")
 
     print("saved prefix:", prefix)
 
