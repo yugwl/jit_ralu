@@ -1,6 +1,7 @@
 import argparse
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 使用第 4 张卡
+import time
 from types import SimpleNamespace
 
 import torch
@@ -100,6 +101,35 @@ def save_sample(tensor, path):
     save_image(image, path)
 
 
+def sync_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+
+
+def generate_outputs(model, args, labels, device):
+    sync_device(device)
+    start = time.perf_counter()
+    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
+        if args.use_ralu:
+            if args.ralu_mode == "full_mixed_full":
+                outputs = model.generate_ralu_full_mixed_diagnostic(labels)
+            else:
+                outputs = model.generate_ralu_diagnostic(labels)
+        else:
+            outputs = {"sample": model.generate(labels)}
+    sync_device(device)
+    elapsed = time.perf_counter() - start
+    return outputs, elapsed
+
+
+def print_timings(title, seconds, outputs=None):
+    print(f"{title}: {seconds:.4f}s")
+    timings = outputs.get("timings") if outputs is not None else None
+    if timings:
+        for name, value in timings.items():
+            print(f"  {name}: {value:.4f}s")
+
+
 @torch.no_grad()
 def main():
     parser = argparse.ArgumentParser()
@@ -137,6 +167,9 @@ def main():
     parser.add_argument("--low_pos_mode", default="scaled", choices=["scaled", "native"])
     parser.add_argument("--no_ralu", action="store_true")
     parser.add_argument("--no_ema", action="store_true")
+    parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--warmup_runs", type=int, default=1)
+    parser.add_argument("--timed_runs", type=int, default=3)
     cli = parser.parse_args()
     cli = apply_checkpoint_defaults(cli)
 
@@ -165,14 +198,30 @@ def main():
 
     labels = torch.tensor([cli.label], device=device, dtype=torch.long)
 
-    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=(device.type == "cuda")):
-        if args.use_ralu:
-            if args.ralu_mode == "full_mixed_full":
-                outputs = model.generate_ralu_full_mixed_diagnostic(labels)
-            else:
-                outputs = model.generate_ralu_diagnostic(labels)
-        else:
-            outputs = {"sample": model.generate(labels)}
+    if cli.benchmark:
+        for i in range(cli.warmup_runs):
+            outputs, elapsed = generate_outputs(model, args, labels, device)
+            print_timings(f"warmup {i + 1}/{cli.warmup_runs}", elapsed, outputs)
+
+        elapsed_runs = []
+        stage_sums = {}
+        outputs = None
+        for i in range(cli.timed_runs):
+            outputs, elapsed = generate_outputs(model, args, labels, device)
+            elapsed_runs.append(elapsed)
+            print_timings(f"timed {i + 1}/{cli.timed_runs}", elapsed, outputs)
+            timings = outputs.get("timings", {})
+            for name, value in timings.items():
+                stage_sums[name] = stage_sums.get(name, 0.0) + float(value)
+
+        avg_elapsed = sum(elapsed_runs) / len(elapsed_runs)
+        print(f"benchmark_avg_total: {avg_elapsed:.4f}s")
+        if stage_sums:
+            for name, value in stage_sums.items():
+                print(f"benchmark_avg_{name}: {value / len(elapsed_runs):.4f}s")
+    else:
+        outputs, elapsed = generate_outputs(model, args, labels, device)
+        print_timings("single_run", elapsed, outputs)
 
     prefix = os.path.join(cli.out_dir, f"label{cli.label}_seed{cli.seed}")
     suffix = args.ralu_mode if args.use_ralu else "base"

@@ -1,3 +1,4 @@
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -273,6 +274,18 @@ class Denoiser(nn.Module):
             raise NotImplementedError(f"Unsupported sampler: {self.method}")
 
         return z_next, x0_t
+
+    def _profile_sync(self, device):
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _profile_start(self, device):
+        self._profile_sync(device)
+        return time.perf_counter()
+
+    def _profile_end(self, device, start_time):
+        self._profile_sync(device)
+        return time.perf_counter() - start_time
 
     @torch.no_grad()
     def _lift_low_state_to_full(self, z_low, x0_low, t, full_hw):
@@ -594,8 +607,11 @@ class Denoiser(nn.Module):
 
         device = labels.device
         bsz = labels.size(0)
+        timings = {}
+        total_start = self._profile_start(device)
         z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
 
+        stage_start = self._profile_start(device)
         ts = torch.linspace(0.0, self.ralu_e[0], self.ralu_N[0] + 1, device=device)
         for i in range(self.ralu_N[0]):
             z, _ = self._ode_step_with_fn(
@@ -608,9 +624,14 @@ class Denoiser(nn.Module):
 
         _, x0_stage1_full = self._cfg_v_and_x(self.net, z, ts[-1], labels)
         z_after_stage1 = z
+        timings["stage1_full"] = self._profile_end(device, stage_start)
+
+        stage_start = self._profile_start(device)
         layout = self._edge_layout_from_full_x0(x0_stage1_full)
+        timings["layout"] = self._profile_end(device, stage_start)
         current_t = self.ralu_e[0]
 
+        stage_start = self._profile_start(device)
         if self.ralu_N[1] > 0:
             ts = torch.linspace(current_t, self.ralu_e[1], self.ralu_N[1] + 1, device=device)
             for i in range(self.ralu_N[1]):
@@ -625,7 +646,9 @@ class Denoiser(nn.Module):
 
         z_after_mixed = z
         _, x0_after_mixed_full = self._cfg_v_and_x(self.net, z, current_t, labels)
+        timings["mixed_token"] = self._profile_end(device, stage_start)
 
+        stage_start = self._profile_start(device)
         ts = torch.linspace(current_t, self.ralu_e[2], self.ralu_N[2] + 1, device=device)
         for i in range(self.ralu_N[2]):
             z, _ = self._ode_step_with_fn(
@@ -635,6 +658,8 @@ class Denoiser(nn.Module):
                 ts[i + 1],
                 labels,
             )
+        timings["stage3_full"] = self._profile_end(device, stage_start)
+        timings["total_model"] = self._profile_end(device, total_start)
 
         return {
             "sample": z,
@@ -642,6 +667,7 @@ class Denoiser(nn.Module):
             "z_after_stage1": z_after_stage1,
             "z_after_mixed": z_after_mixed,
             "x0_after_mixed_full": x0_after_mixed_full,
+            "timings": timings,
         }
 
     @torch.no_grad()
