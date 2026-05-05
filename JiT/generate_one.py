@@ -1,5 +1,4 @@
 import os
-import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 使用第 4 张卡
 import argparse
 from types import SimpleNamespace
@@ -10,11 +9,11 @@ from torchvision.utils import save_image
 from denoiser import Denoiser
 
 
-def build_args():
+def build_args(cli):
     return SimpleNamespace(
         # checkpoint / model
-        model="JiT-B/32",
-        img_size=512,
+        model=cli.model,
+        img_size=cli.img_size,
         class_num=1000,
 
         # architecture
@@ -26,29 +25,26 @@ def build_args():
         P_mean=-0.8,
         P_std=0.8,
         t_eps=5e-2,
-        noise_scale=2.0,
+        noise_scale=cli.noise_scale,
         ema_decay1=0.9999,
         ema_decay2=0.9996,
 
         # sampling
-        sampling_method="heun",
-        num_sampling_steps=50,
-        cfg=5.0,
-        interval_min=0.1,
-        interval_max=1.0,
+        sampling_method=cli.sampling_method,
+        num_sampling_steps=cli.num_sampling_steps,
+        cfg=cli.cfg,
+        interval_min=cli.interval_min,
+        interval_max=cli.interval_max,
 
         # RALU switch
-        use_ralu=True,
-        ralu_f0=2,
-        # ralu_N=[10, 4, 8],
-        # ralu_N=[16, 0, 20],
-        # ralu_e=[0.35, 0.55, 1.0],
-        # ralu_up_ratio=0.0,
-        # ralu_hf_noise=1.0,
-        ralu_N=[16, 0, 24],
-        ralu_e=[0.35, 0.55, 1.0],
+        use_ralu=not cli.no_ralu,
+        ralu_f0=cli.ralu_f0,
+        ralu_N=[cli.low_steps, 0, cli.full_steps],
+        ralu_e=[cli.low_end, cli.low_end, 1.0],
         ralu_up_ratio=0.0,
-        ralu_hf_noise=0.0,
+        ralu_hf_noise=cli.ralu_hf_noise,
+        ralu_lift_mode=cli.lift_mode,
+        ralu_low_pos_mode=cli.low_pos_mode,
     )
 
 
@@ -72,25 +68,51 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
-        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-b-32/checkpoint-last.pth",
+        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-l-16/checkpoint-last.pth",
     )
     parser.add_argument(
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result",
     )
     parser.add_argument("--label", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=2)
+    parser.add_argument("--model", default="JiT-L/16")
+    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--noise_scale", type=float, default=1.0)
+    parser.add_argument("--cfg", type=float, default=2.4)
+    parser.add_argument("--interval_min", type=float, default=0.1)
+    parser.add_argument("--interval_max", type=float, default=1.0)
+    parser.add_argument("--sampling_method", default="heun", choices=["heun", "euler"])
+    parser.add_argument("--num_sampling_steps", type=int, default=50)
+    parser.add_argument("--ralu_f0", type=int, default=2)
+    parser.add_argument("--low_steps", type=int, default=16)
+    parser.add_argument("--low_end", type=float, default=0.35)
+    parser.add_argument("--full_steps", type=int, default=24)
+    parser.add_argument("--ralu_hf_noise", type=float, default=0.0)
+    parser.add_argument("--lift_mode", default="fresh_noise", choices=["fresh_noise", "upsample_eps", "mixed_noise"])
+    parser.add_argument("--low_pos_mode", default="scaled", choices=["scaled", "native"])
     parser.add_argument("--no_ralu", action="store_true")
     args_cli = parser.parse_args()
 
     os.makedirs(args_cli.out_dir, exist_ok=True)
 
-    args = build_args()
-    if args_cli.no_ralu:
-        args.use_ralu = False
+    torch.manual_seed(args_cli.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args_cli.seed)
+
+    args = build_args(args_cli)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
     print("use_ralu:", args.use_ralu)
+    print("model:", args.model)
+    print("img_size:", args.img_size)
+    print("noise_scale:", args.noise_scale)
+    print("cfg:", args.cfg_scale if hasattr(args, "cfg_scale") else args.cfg)
+    print("ralu_N:", args.ralu_N)
+    print("ralu_e:", args.ralu_e)
+    print("ralu_lift_mode:", args.ralu_lift_mode)
+    print("ralu_low_pos_mode:", args.ralu_low_pos_mode)
 
     model = Denoiser(args)
     model = load_checkpoint(model, args_cli.ckpt, use_ema=True)
@@ -114,6 +136,4 @@ def main():
 
 
 if __name__ == "__main__":
-    torch.manual_seed(2)
-    torch.cuda.manual_seed_all(2)
     main()
