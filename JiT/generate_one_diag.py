@@ -80,7 +80,7 @@ def main():
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag",
     )
-    parser.add_argument("--label", type=int, default=2)
+    parser.add_argument("--label", type=int, default=0)
     parser.add_argument("--seed", type=int, default=3)
     parser.add_argument("--model", default="JiT-B/32")
     parser.add_argument("--img_size", type=int, default=512)
