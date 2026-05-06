@@ -1,7 +1,6 @@
 import argparse
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 使用第 4 张卡
-import shlex
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"  # 使用第 4 张卡
 import time
 from types import SimpleNamespace
 
@@ -171,9 +170,9 @@ def build_parser():
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full_0.2",
     )
-    parser.add_argument("--label", type=int, default=2)
+    parser.add_argument("--label", type=int, default=281)
     parser.add_argument("--num_samples", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--model", default="JiT-H/32")
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--noise_scale", type=float, default=None)
@@ -190,9 +189,9 @@ def build_parser():
     parser.add_argument("--full_steps", type=int, default=24)
     parser.add_argument("--stage1_steps", type=int, default=20)
     parser.add_argument("--stage1_end", type=float, default=0.30)
-    parser.add_argument("--mixed_steps", type=int, default=12)
+    parser.add_argument("--mixed_steps", type=int, default=20)
     parser.add_argument("--mixed_end", type=float, default=0.55)
-    parser.add_argument("--stage3_steps", type=int, default=32)
+    parser.add_argument("--stage3_steps", type=int, default=10)
     parser.add_argument("--ralu_hf_noise", type=float, default=0.0)
     parser.add_argument("--lift_mode", default="fresh_noise", choices=["fresh_noise", "upsample_eps", "mixed_noise"])
     parser.add_argument("--low_pos_mode", default="scaled", choices=["scaled", "native"])
