@@ -142,6 +142,7 @@ def main():
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full_0.2",
     )
     parser.add_argument("--label", type=int, default=2)
+    parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model", default="JiT-H/32")
     parser.add_argument("--img_size", type=int, default=None)
@@ -196,7 +197,7 @@ def main():
     model.to(device)
     model.eval()
 
-    labels = torch.tensor([cli.label], device=device, dtype=torch.long)
+    labels = torch.full((cli.num_samples,), cli.label, device=device, dtype=torch.long)
 
     if cli.benchmark:
         for i in range(cli.warmup_runs):
@@ -225,13 +226,24 @@ def main():
 
     prefix = os.path.join(cli.out_dir, f"label{cli.label}_seed{cli.seed}")
     suffix = args.ralu_mode if args.use_ralu else "base"
-    save_sample(outputs["sample"], f"{prefix}_{suffix}.png")
+    save_sample(outputs["sample"], f"{prefix}_{suffix}_grid.png")
+
+    for sample_idx in range(outputs["sample"].size(0)):
+        save_sample(
+            outputs["sample"][sample_idx:sample_idx + 1],
+            f"{prefix}_{suffix}_sample{sample_idx:02d}.png",
+        )
 
     if args.use_ralu:
         for name, tensor in outputs.items():
             if name == "sample" or not torch.is_tensor(tensor) or tensor.ndim != 4:
                 continue
-            save_sample(tensor, f"{prefix}_{name}.png")
+            save_sample(tensor, f"{prefix}_{name}_grid.png")
+            for sample_idx in range(tensor.size(0)):
+                save_sample(
+                    tensor[sample_idx:sample_idx + 1],
+                    f"{prefix}_{name}_sample{sample_idx:02d}.png",
+                )
 
     print("saved prefix:", prefix)
 
