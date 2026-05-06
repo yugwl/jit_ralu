@@ -170,7 +170,7 @@ def build_parser():
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full_0.2",
     )
-    parser.add_argument("--label", type=int, default=281)
+    parser.add_argument("--label", type=int, default=285)
     parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--model", default="JiT-H/32")
@@ -179,7 +179,7 @@ def build_parser():
     parser.add_argument("--cfg", type=float, default=None)
     parser.add_argument("--interval_min", type=float, default=0.1)
     parser.add_argument("--interval_max", type=float, default=1.0)
-    parser.add_argument("--sampling_method", default="euler", choices=["heun", "euler"])
+    parser.add_argument("--sampling_method", default="heun", choices=["heun", "euler"])
     parser.add_argument("--num_sampling_steps", type=int, default=64)
     parser.add_argument("--ralu_mode", default="low_full_diag", choices=["low_full_diag", "full_mixed_full"])
     parser.add_argument("--ralu_f0", type=int, default=2)
