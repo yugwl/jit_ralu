@@ -1,6 +1,7 @@
 import argparse
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "7"  # 使用第 4 张卡
+import shlex
 import time
 from types import SimpleNamespace
 
@@ -160,8 +161,7 @@ def print_timings(title, seconds, outputs=None):
             print(f"  {name}: {value:.4f}s")
 
 
-@torch.no_grad()
-def main():
+def build_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
@@ -201,18 +201,40 @@ def main():
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--warmup_runs", type=int, default=1)
     parser.add_argument("--timed_runs", type=int, default=3)
-    cli = parser.parse_args()
-    cli = apply_checkpoint_defaults(cli)
+    parser.add_argument(
+        "--interactive",
+        action="store_true",
+        help="Load the checkpoint once, then repeatedly accept per-run config lines until exit.",
+    )
+    return parser
 
-    os.makedirs(cli.out_dir, exist_ok=True)
 
-    torch.manual_seed(cli.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cli.seed)
+def apply_runtime_config(model, args):
+    old_ralu_f0 = getattr(model, "ralu_f0", None)
+    old_low_pos_mode = getattr(model, "ralu_low_pos_mode", None)
 
-    args = build_args(cli)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("device:", device)
+    model.noise_scale = args.noise_scale
+    model.method = args.sampling_method
+    model.steps = args.num_sampling_steps
+    model.cfg_scale = args.cfg
+    model.cfg_interval = (args.interval_min, args.interval_max)
+
+    model.use_ralu = args.use_ralu
+    model.ralu_mode = args.ralu_mode
+    model.ralu_f0 = args.ralu_f0
+    model.ralu_N = args.ralu_N
+    model.ralu_e = args.ralu_e
+    model.ralu_up_ratio = args.ralu_up_ratio
+    model.ralu_hf_noise = args.ralu_hf_noise
+    model.ralu_lift_mode = args.ralu_lift_mode
+    model.ralu_low_pos_mode = args.ralu_low_pos_mode
+
+    if old_ralu_f0 != model.ralu_f0 or old_low_pos_mode != model.ralu_low_pos_mode:
+        if hasattr(model, "reset_ralu_cache"):
+            model.reset_ralu_cache()
+
+
+def print_config(args):
     print("use_ralu:", args.use_ralu)
     print("ralu_mode:", args.ralu_mode)
     print("ralu_N:", args.ralu_N)
@@ -222,12 +244,19 @@ def main():
     print("ralu_lift_mode:", args.ralu_lift_mode)
     print("ralu_low_pos_mode:", args.ralu_low_pos_mode)
 
-    model = Denoiser(args)
-    model = load_checkpoint(model, cli.ckpt, use_ema=not cli.no_ema)
-    model.to(device)
-    model.eval()
+
+def run_config(model, cli, device, run_name=None):
+    os.makedirs(cli.out_dir, exist_ok=True)
+    torch.manual_seed(cli.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cli.seed)
+
+    args = build_args(cli)
+    apply_runtime_config(model, args)
+    print_config(args)
 
     labels = torch.full((cli.num_samples,), cli.label, device=device, dtype=torch.long)
+    outputs_to_save = None
 
     if cli.benchmark:
         for i in range(cli.warmup_runs):
@@ -240,6 +269,8 @@ def main():
         for i in range(cli.timed_runs):
             outputs, elapsed = generate_outputs(model, args, labels, device)
             elapsed_runs.append(elapsed)
+            if outputs_to_save is None:
+                outputs_to_save = outputs
             print_timings(f"timed {i + 1}/{cli.timed_runs}", elapsed, outputs)
             timings = outputs.get("timings", {})
             for name, value in timings.items():
@@ -252,19 +283,135 @@ def main():
                 print(f"benchmark_avg_{name}: {value / len(elapsed_runs):.4f}s")
     else:
         outputs, elapsed = generate_outputs(model, args, labels, device)
+        outputs_to_save = outputs
         print_timings("single_run", elapsed, outputs)
 
-    prefix = os.path.join(cli.out_dir, f"label{cli.label}_seed{cli.seed}")
+    if outputs_to_save is None:
+        raise RuntimeError("No timed outputs were produced. Increase --timed_runs or disable --benchmark.")
+
+    prefix_name = f"label{cli.label}_seed{cli.seed}"
+    if run_name is not None:
+        prefix_name = f"{run_name}_{prefix_name}"
+    prefix = os.path.join(cli.out_dir, prefix_name)
     suffix = args.ralu_mode if args.use_ralu else "base"
-    save_tensor_outputs(outputs["sample"], prefix, suffix)
+    save_tensor_outputs(outputs_to_save["sample"], prefix, suffix)
 
     if args.use_ralu:
-        for name, tensor in outputs.items():
+        for name, tensor in outputs_to_save.items():
             if name == "sample" or not torch.is_tensor(tensor) or tensor.ndim != 4:
                 continue
             save_tensor_outputs(tensor, prefix, name)
 
     print("saved prefix:", prefix)
+    return outputs_to_save
+
+
+def parse_interactive_line(parser, base_cli, line):
+    text = line.strip()
+    if not text:
+        return None, None
+    if text.lower() in {"exit", "quit", "q"}:
+        return "exit", None
+    if text.lower() in {"help", "h", "?"}:
+        print_interactive_help()
+        return None, None
+    if text.lower() == "args":
+        parser.print_help()
+        return None, None
+
+    tokens = shlex.split(text, posix=(os.name != "nt"))
+    tokens = [token.strip("\"'") for token in tokens]
+    alias = None
+    if tokens and tokens[0] in {"base", "baseline"}:
+        alias = "base"
+        tokens = tokens[1:] + ["--no_ralu"]
+    elif tokens and tokens[0] in {"ralu", "full_mixed_full"}:
+        alias = "ralu"
+        tokens = tokens[1:] + ["--ralu_mode", "full_mixed_full"]
+    elif tokens and tokens[0] in {"low", "low_full"}:
+        alias = "low_full"
+        tokens = tokens[1:] + ["--ralu_mode", "low_full_diag"]
+
+    cli = SimpleNamespace(**vars(base_cli))
+    try:
+        cli = parser.parse_args(tokens, namespace=cli)
+    except SystemExit:
+        return None, None
+
+    if alias in {"ralu", "low_full"}:
+        cli.no_ralu = False
+    if alias == "base":
+        cli.no_ralu = True
+    return cli, alias
+
+
+def print_interactive_help():
+    print("Interactive commands:")
+    print("  base --label 281 --seed 42")
+    print("  ralu --label 281 --seed 42 --ralu_up_ratio 0.2 --stage1_steps 20 --mixed_steps 12 --stage3_steps 32")
+    print("  low --label 281 --seed 42 --low_steps 16 --full_steps 24")
+    print("  args      show all argparse options")
+    print("  exit      quit")
+    print("Each line starts from the launch-time defaults; model/checkpoint stay loaded.")
+
+
+def check_load_time_config(base_cli, run_cli):
+    load_time_keys = ["ckpt", "model", "img_size", "no_ema"]
+    changed = [
+        key for key in load_time_keys
+        if getattr(base_cli, key) != getattr(run_cli, key)
+    ]
+    if changed:
+        print("These options require restarting the script and were not run:", ", ".join(changed))
+        return False
+    return True
+
+
+def interactive_loop(parser, base_cli, model, device):
+    print_interactive_help()
+    run_idx = 1
+    while True:
+        try:
+            line = input("jit-diag> ")
+        except EOFError:
+            print()
+            break
+
+        cli, alias = parse_interactive_line(parser, base_cli, line)
+        if cli == "exit":
+            break
+        if cli is None:
+            continue
+        if not check_load_time_config(base_cli, cli):
+            continue
+
+        tag = alias if alias is not None else ("ralu" if not cli.no_ralu else "base")
+        run_name = f"run{run_idx:03d}_{tag}"
+        print(f"=== {run_name} ===")
+        run_config(model, cli, device, run_name=run_name)
+        run_idx += 1
+
+
+@torch.no_grad()
+def main():
+    parser = build_parser()
+    cli = parser.parse_args()
+    cli = apply_checkpoint_defaults(cli)
+
+    args = build_args(cli)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("device:", device)
+
+    model = Denoiser(args)
+    model = load_checkpoint(model, cli.ckpt, use_ema=not cli.no_ema)
+    model.to(device)
+    model.eval()
+
+    if cli.interactive:
+        base_cli = SimpleNamespace(**vars(cli))
+        interactive_loop(parser, base_cli, model, device)
+    else:
+        run_config(model, cli, device)
 
 
 if __name__ == "__main__":
