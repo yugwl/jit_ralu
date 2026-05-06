@@ -142,7 +142,7 @@ def main():
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full_0.2",
     )
     parser.add_argument("--label", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=3)
+    parser.add_argument("--seed", type=int, default=4)
     parser.add_argument("--model", default="JiT-L/16")
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--noise_scale", type=float, default=None)
