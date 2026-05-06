@@ -135,15 +135,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--ckpt",
-        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-l-16/checkpoint-last.pth",
+        default="/home/cvip/deyu/jit_ralu/checkpoints/jit-h-32/checkpoint-last.pth",
     )
     parser.add_argument(
         "--out_dir",
         default="/home/cvip/deyu/jit_ralu/JiT/result_diag_full_0.2",
     )
     parser.add_argument("--label", type=int, default=2)
-    parser.add_argument("--seed", type=int, default=4)
-    parser.add_argument("--model", default="JiT-L/16")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--model", default="JiT-H/32")
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--noise_scale", type=float, default=None)
     parser.add_argument("--cfg", type=float, default=None)
