@@ -173,7 +173,7 @@ def main():
     )
     parser.add_argument("--label", type=int, default=281)
     parser.add_argument("--num_samples", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=123)
+    parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--model", default="JiT-H/32")
     parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--noise_scale", type=float, default=None)

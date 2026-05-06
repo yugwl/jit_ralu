@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"  # 使用第 4 张卡
 import random
 
 import numpy as np
@@ -17,9 +18,9 @@ def get_args_parser():
     parser.add_argument("--noise_scale", default=2.0, type=float)
     parser.add_argument("--class_num", default=1000, type=int)
 
-    parser.add_argument("--ckpt", required=True, type=str,
+    parser.add_argument("--ckpt", default="/home/cvip/deyu/jit_ralu/checkpoints/jit-h-32/checkpoint-last.pth", type=str,
                         help="Path to checkpoint-last.pth")
-    parser.add_argument("--out_dir", required=True, type=str)
+    parser.add_argument("--out_dir", default="/home/cvip/deyu/jit_ralu/JiT/samples", type=str)
     parser.add_argument("--labels", default="0,281,285,951", type=str,
                         help="Comma-separated ImageNet class ids")
     parser.add_argument("--num_per_class", default=4, type=int)
