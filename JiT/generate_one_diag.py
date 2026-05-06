@@ -14,6 +14,21 @@ def _patch_size_from_model_name(model_name):
     return int(model_name.split("/")[-1])
 
 
+def _model_size_from_model_name(model_name):
+    return model_name.split("/")[0].split("-")[-1]
+
+
+def _recommended_cfg(model_name, img_size):
+    model_size = _model_size_from_model_name(model_name)
+    if model_size == "B":
+        return 3.0
+    if model_size == "L":
+        return 2.5 if img_size == 512 else 2.4
+    if model_size == "H":
+        return 2.3 if img_size == 512 else 2.2
+    raise ValueError(f"Unsupported JiT model size in model name: {model_name}")
+
+
 def apply_checkpoint_defaults(cli):
     ckpt = torch.load(cli.ckpt, map_location="cpu")
     pos_embed = ckpt["model"]["net.pos_embed"]
@@ -25,11 +40,13 @@ def apply_checkpoint_defaults(cli):
     if cli.noise_scale is None:
         cli.noise_scale = 2.0 if cli.img_size == 512 else 1.0
     if cli.cfg is None:
-        cli.cfg = 2.5 if cli.img_size == 512 else 2.4
+        cli.cfg = _recommended_cfg(cli.model, cli.img_size)
 
     print("checkpoint pos_embed:", tuple(pos_embed.shape))
     print("inferred grid_size:", grid_size)
     print("runtime img_size:", cli.img_size)
+    print("runtime noise_scale:", cli.noise_scale)
+    print("runtime cfg:", cli.cfg)
     return cli
 
 
@@ -99,6 +116,19 @@ def save_sample(tensor, path):
     image = (tensor + 1.0) / 2.0
     image = image.clamp(0, 1)
     save_image(image, path)
+
+
+def save_tensor_outputs(tensor, prefix, name):
+    if tensor.size(0) == 1:
+        save_sample(tensor, f"{prefix}_{name}.png")
+        return
+
+    save_sample(tensor, f"{prefix}_{name}_grid.png")
+    for sample_idx in range(tensor.size(0)):
+        save_sample(
+            tensor[sample_idx:sample_idx + 1],
+            f"{prefix}_{name}_sample{sample_idx:02d}.png",
+        )
 
 
 def sync_device(device):
@@ -226,24 +256,13 @@ def main():
 
     prefix = os.path.join(cli.out_dir, f"label{cli.label}_seed{cli.seed}")
     suffix = args.ralu_mode if args.use_ralu else "base"
-    save_sample(outputs["sample"], f"{prefix}_{suffix}_grid.png")
-
-    for sample_idx in range(outputs["sample"].size(0)):
-        save_sample(
-            outputs["sample"][sample_idx:sample_idx + 1],
-            f"{prefix}_{suffix}_sample{sample_idx:02d}.png",
-        )
+    save_tensor_outputs(outputs["sample"], prefix, suffix)
 
     if args.use_ralu:
         for name, tensor in outputs.items():
             if name == "sample" or not torch.is_tensor(tensor) or tensor.ndim != 4:
                 continue
-            save_sample(tensor, f"{prefix}_{name}_grid.png")
-            for sample_idx in range(tensor.size(0)):
-                save_sample(
-                    tensor[sample_idx:sample_idx + 1],
-                    f"{prefix}_{name}_sample{sample_idx:02d}.png",
-                )
+            save_tensor_outputs(tensor, prefix, name)
 
     print("saved prefix:", prefix)
 
