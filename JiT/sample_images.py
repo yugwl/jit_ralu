@@ -24,7 +24,7 @@ def get_args_parser():
     parser.add_argument("--labels", default="0,281,285,951", type=str,
                         help="Comma-separated ImageNet class ids")
     parser.add_argument("--num_per_class", default=4, type=int)
-    parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--seed", default=42, type=int)
     parser.add_argument("--device", default="cuda", type=str)
 
     parser.add_argument("--sampling_method", default="heun", type=str)
